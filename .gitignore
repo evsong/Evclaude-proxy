@@ -1,0 +1,5 @@
+node_modules/
+stats.json
+presets.json
+.env
+.DS_Store
