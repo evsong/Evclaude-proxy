@@ -1,3 +1,4 @@
+require("dotenv").config();
 const express = require("express");
 const { createProxyMiddleware } = require("http-proxy-middleware");
 const cors = require("cors");
@@ -15,11 +16,18 @@ const TARGET_API = "https://open.bigmodel.cn/api/anthropic";
 const ADMIN_USER = process.env.ADMIN_USER || "admin";
 const ADMIN_PASS = process.env.ADMIN_PASS || "evclaude2024";
 
+const UPSTREAM_API_KEY = process.env.UPSTREAM_API_KEY || "";
+const CLIENT_API_KEYS = (process.env.CLIENT_API_KEYS || "sk-evclaude-001,sk-evclaude-002").split(",");
+
 // 统计数据存储文件
 const STATS_FILE = path.join(__dirname, "stats.json");
 
 // 预设问答配置文件
 const PRESETS_FILE = path.join(__dirname, "presets.json");
+
+const KEYS_FILE = path.join(__dirname, "keys.json");
+
+let apiKeys = [];
 
 // 初始化统计数据
 let stats = {
@@ -36,6 +44,45 @@ let stats = {
 };
 
 let presets = [];
+
+function generateApiKey() {
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  let key = "sk-ant-oat01-";
+  for (let i = 0; i < 52; i++) key += chars.charAt(Math.floor(Math.random() * chars.length));
+  key += "-";
+  for (let i = 0; i < 22; i++) key += chars.charAt(Math.floor(Math.random() * chars.length));
+  return key;
+}
+
+async function loadKeys() {
+  try {
+    if (fs.existsSync(KEYS_FILE)) {
+      const data = await fsPromises.readFile(KEYS_FILE, "utf8");
+      apiKeys = JSON.parse(data);
+    }
+  } catch (e) { console.error("加载Keys失败:", e); }
+}
+
+async function saveKeys() {
+  try {
+    await fsPromises.writeFile(KEYS_FILE, JSON.stringify(apiKeys, null, 2));
+  } catch (e) { console.error("保存Keys失败:", e); }
+}
+
+function validateClientKey(req, res, next) {
+  const authHeader = req.headers["x-api-key"] || req.headers.authorization;
+  if (!authHeader) {
+    return res.status(401).json({ error: "Missing API key" });
+  }
+  const key = authHeader.replace(/^Bearer\s+/i, "");
+  const keyObj = apiKeys.find(k => k.key === key && k.enabled);
+  if (!keyObj) {
+    return res.status(403).json({ error: "Invalid API key" });
+  }
+  req.apiKeyId = keyObj.id;
+  req.apiKeyName = keyObj.name;
+  next();
+}
 
 // Basic Auth 中间件 (安全认证)
 function basicAuth(req, res, next) {
@@ -217,7 +264,7 @@ function buildClaudeResponse(text, isStream = false) {
 }
 
 // 更新统计数据
-function updateStats(endpoint, success) {
+function updateStats(endpoint, success, keyId) {
   stats.totalRequests++;
   stats.todayRequests++;
 
@@ -238,6 +285,14 @@ function updateStats(endpoint, success) {
   }
   stats.endpoints[endpoint].count++;
 
+  if (keyId) {
+    if (!stats.keyStats) stats.keyStats = {};
+    if (!stats.keyStats[keyId]) stats.keyStats[keyId] = { requests: 0, success: 0, failed: 0 };
+    stats.keyStats[keyId].requests++;
+    if (success) stats.keyStats[keyId].success++;
+    else stats.keyStats[keyId].failed++;
+  }
+
   debouncedSaveStats();
 }
 
@@ -248,7 +303,7 @@ app.use(cors());
 app.use(express.json({ limit: "50mb" }));
 
 // 预设问答拦截中间件
-app.use("/v1/messages", (req, res, next) => {
+app.use("/v1/messages", validateClientKey, (req, res, next) => {
   if (req.method !== "POST") {
     return next();
   }
@@ -258,7 +313,7 @@ app.use("/v1/messages", (req, res, next) => {
 
   if (presetResponse) {
     console.log("[PRESET] 使用预设回复");
-    updateStats(req.path, true);
+    updateStats(req.path, true, req.apiKeyId);
 
     const isStream = req.body.stream === true;
 
@@ -288,6 +343,10 @@ const proxy = createProxyMiddleware({
   onProxyReq: (proxyReq, req, res) => {
     console.log("[REQUEST] " + req.method + " " + req.url + " -> " + TARGET_API + req.url);
 
+    if (UPSTREAM_API_KEY) {
+      proxyReq.setHeader("Authorization", "Bearer " + UPSTREAM_API_KEY);
+    }
+
     if (req.body && Object.keys(req.body).length > 0) {
       const bodyData = JSON.stringify(req.body);
       proxyReq.setHeader("Content-Type", "application/json");
@@ -298,11 +357,11 @@ const proxy = createProxyMiddleware({
   onProxyRes: (proxyRes, req, res) => {
     const success = proxyRes.statusCode >= 200 && proxyRes.statusCode < 400;
     console.log("[RESPONSE] " + req.method + " " + req.url + " -> " + proxyRes.statusCode);
-    updateStats(req.path, success);
+    updateStats(req.path, success, req.apiKeyId);
   },
   onError: (err, req, res) => {
     console.error("[PROXY ERROR]", err.message);
-    updateStats(req.path, false);
+    updateStats(req.path, false, req.apiKeyId);
     if (!res.headersSent) {
       res.status(502).json({
         error: "Proxy Error",
@@ -318,6 +377,47 @@ app.get("/admin/api/stats", basicAuth, (req, res) => {
 
 app.get("/admin/api/presets", basicAuth, (req, res) => {
   res.json(presets);
+});
+
+app.get("/admin/api/keys", basicAuth, (req, res) => {
+  res.json(apiKeys);
+});
+
+app.post("/admin/api/keys", basicAuth, (req, res) => {
+  const { name } = req.body;
+  const newKey = {
+    id: Date.now().toString(),
+    name: name || "Unnamed Key",
+    key: generateApiKey(),
+    enabled: true,
+    createdAt: new Date().toISOString()
+  };
+  apiKeys.push(newKey);
+  saveKeys();
+  res.json(newKey);
+});
+
+app.delete("/admin/api/keys/:id", basicAuth, (req, res) => {
+  const idx = apiKeys.findIndex(k => k.id === req.params.id);
+  if (idx >= 0) {
+    apiKeys.splice(idx, 1);
+    saveKeys();
+    res.json({ success: true });
+  } else {
+    res.status(404).json({ error: "Key not found" });
+  }
+});
+
+app.patch("/admin/api/keys/:id", basicAuth, (req, res) => {
+  const key = apiKeys.find(k => k.id === req.params.id);
+  if (key) {
+    if (req.body.enabled !== undefined) key.enabled = req.body.enabled;
+    if (req.body.name) key.name = req.body.name;
+    saveKeys();
+    res.json(key);
+  } else {
+    res.status(404).json({ error: "Key not found" });
+  }
 });
 
 app.post("/admin/api/presets", basicAuth, (req, res) => {
@@ -365,96 +465,112 @@ function createAdminHTML() {
     body { background-color: #f5f5f5; }
     .navbar { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
     .stat-value { font-size: 2rem; font-weight: bold; }
-    .preset-card { margin-bottom: 1rem; }
-    .keywords { display: flex; flex-wrap: wrap; gap: 5px; }
-    .keyword { background: #e9ecef; padding: 2px 8px; border-radius: 4px; font-size: 0.85rem; }
+    .key-item { font-family: monospace; font-size: 0.8rem; word-break: break-all; }
+    .tab-content { padding-top: 20px; }
   </style>
 </head>
 <body>
   <nav class="navbar navbar-dark"><div class="container-fluid"><span class="navbar-brand">Claude API 代理</span></div></nav>
   <div class="container mt-4">
     <div class="row g-4" id="stats"></div>
-
-    <h4 class="mt-5">预设问答管理</h4>
-    <div id="presets" class="mt-3"></div>
-
-    <div class="card mt-4">
-      <div class="card-header">添加新预设</div>
-      <div class="card-body">
-        <div class="mb-3">
-          <label class="form-label">关键词 (逗号分隔)</label>
-          <input type="text" class="form-control" id="newKeywords" placeholder="公共宣传,日本,大学">
-        </div>
-        <div class="mb-3">
-          <label class="form-label">最少匹配数量</label>
-          <input type="number" class="form-control" id="newMatchCount" value="2" min="1">
-        </div>
-        <div class="mb-3">
-          <label class="form-label">预设回复</label>
-          <textarea class="form-control" id="newResponse" rows="5"></textarea>
-        </div>
-        <button class="btn btn-primary" onclick="addPreset()">添加预设</button>
+    <ul class="nav nav-tabs mt-4">
+      <li class="nav-item"><a class="nav-link active" data-bs-toggle="tab" href="#keys">API Keys</a></li>
+      <li class="nav-item"><a class="nav-link" data-bs-toggle="tab" href="#presets">预设问答</a></li>
+    </ul>
+    <div class="tab-content">
+      <div class="tab-pane fade show active" id="keys">
+        <div class="card mt-3"><div class="card-header d-flex justify-content-between align-items-center">
+          <span>API Keys 管理</span>
+          <button class="btn btn-sm btn-primary" onclick="createKey()">生成新 Key</button>
+        </div><div class="card-body"><div id="keysList"></div></div></div>
+        <div class="card mt-3"><div class="card-header">Key 使用统计</div><div class="card-body"><div id="keyStats"></div></div></div>
+      </div>
+      <div class="tab-pane fade" id="presets">
+        <div id="presetsList" class="mt-3"></div>
+        <div class="card mt-4"><div class="card-header">添加新预设</div><div class="card-body">
+          <input type="text" class="form-control mb-2" id="newKeywords" placeholder="关键词 (逗号分隔)">
+          <input type="number" class="form-control mb-2" id="newMatchCount" value="2" min="1" placeholder="最少匹配数">
+          <textarea class="form-control mb-2" id="newResponse" rows="3" placeholder="预设回复"></textarea>
+          <button class="btn btn-primary" onclick="addPreset()">添加</button>
+        </div></div>
       </div>
     </div>
   </div>
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
   <script>
+    let allKeys = [], allStats = {};
     async function loadData() {
-      const [statsRes, presetsRes] = await Promise.all([
-        fetch('/admin/api/stats'),
-        fetch('/admin/api/presets')
+      const [statsRes, keysRes, presetsRes] = await Promise.all([
+        fetch('/admin/api/stats'), fetch('/admin/api/keys'), fetch('/admin/api/presets')
       ]);
-      const stats = await statsRes.json();
+      allStats = await statsRes.json();
+      allKeys = await keysRes.json();
       const presets = await presetsRes.json();
-
-      document.getElementById('stats').innerHTML = \`
-        <div class="col-md-3"><div class="card p-3"><h6>总请求</h6><div class="stat-value">\${stats.totalRequests}</div></div></div>
-        <div class="col-md-3"><div class="card p-3"><h6>今日请求</h6><div class="stat-value">\${stats.todayRequests}</div></div></div>
-        <div class="col-md-3"><div class="card p-3"><h6>成功</h6><div class="stat-value">\${stats.successfulRequests}</div></div></div>
-        <div class="col-md-3"><div class="card p-3"><h6>预设数</h6><div class="stat-value">\${presets.length}</div></div></div>
-      \`;
-
-      document.getElementById('presets').innerHTML = presets.map((p, i) => \`
-        <div class="card preset-card">
-          <div class="card-body">
-            <div class="d-flex justify-content-between">
-              <div class="keywords">\${p.keywords.map(k => '<span class="keyword">' + k + '</span>').join('')}</div>
-              <button class="btn btn-sm btn-danger" onclick="deletePreset(\${i})">删除</button>
-            </div>
-            <small class="text-muted">至少匹配 \${p.matchCount || 1} 个关键词</small>
-            <pre class="mt-2 bg-light p-2" style="max-height:100px;overflow:auto;font-size:0.8rem;">\${p.response.substring(0, 200)}...</pre>
-          </div>
-        </div>
-      \`).join('');
+      renderStats(); renderKeys(); renderKeyStats(); renderPresets(presets);
     }
-
+    function renderStats() {
+      document.getElementById('stats').innerHTML = \`
+        <div class="col-md-3"><div class="card p-3"><h6>总请求</h6><div class="stat-value">\${allStats.totalRequests||0}</div></div></div>
+        <div class="col-md-3"><div class="card p-3"><h6>今日请求</h6><div class="stat-value">\${allStats.todayRequests||0}</div></div></div>
+        <div class="col-md-3"><div class="card p-3"><h6>成功</h6><div class="stat-value">\${allStats.successfulRequests||0}</div></div></div>
+        <div class="col-md-3"><div class="card p-3"><h6>API Keys</h6><div class="stat-value">\${allKeys.length}</div></div></div>\`;
+    }
+    function renderKeys() {
+      document.getElementById('keysList').innerHTML = allKeys.length ? allKeys.map(k => \`
+        <div class="d-flex justify-content-between align-items-center border-bottom py-2">
+          <div><strong>\${k.name}</strong><div class="key-item text-muted">\${k.key}</div>
+            <small class="text-muted">创建: \${new Date(k.createdAt).toLocaleString()}</small></div>
+          <div><button class="btn btn-sm \${k.enabled?'btn-warning':'btn-success'} me-1" onclick="toggleKey('\${k.id}',\${!k.enabled})">\${k.enabled?'禁用':'启用'}</button>
+            <button class="btn btn-sm btn-danger" onclick="deleteKey('\${k.id}')">删除</button></div>
+        </div>\`).join('') : '<p class="text-muted">暂无 API Keys</p>';
+    }
+    function renderKeyStats() {
+      const ks = allStats.keyStats || {};
+      document.getElementById('keyStats').innerHTML = Object.keys(ks).length ? \`<table class="table table-sm"><thead><tr><th>Key</th><th>请求</th><th>成功</th><th>失败</th></tr></thead><tbody>\${
+        Object.entries(ks).map(([id,s]) => {
+          const k = allKeys.find(x=>x.id===id);
+          return \`<tr><td>\${k?k.name:id}</td><td>\${s.requests}</td><td>\${s.success}</td><td>\${s.failed}</td></tr>\`;
+        }).join('')
+      }</tbody></table>\` : '<p class="text-muted">暂无统计数据</p>';
+    }
+    function renderPresets(presets) {
+      document.getElementById('presetsList').innerHTML = presets.map((p,i) => \`
+        <div class="card mb-2"><div class="card-body py-2">
+          <div class="d-flex justify-content-between"><div>\${p.keywords.map(k=>'<span class="badge bg-secondary me-1">'+k+'</span>').join('')}</div>
+            <button class="btn btn-sm btn-danger" onclick="deletePreset(\${i})">删除</button></div>
+          <small class="text-muted">匹配 \${p.matchCount||1} 个</small>
+        </div></div>\`).join('');
+    }
+    async function createKey() {
+      const name = prompt('Key 名称:');
+      if (!name) return;
+      await fetch('/admin/api/keys', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name})});
+      loadData();
+    }
+    async function toggleKey(id, enabled) {
+      await fetch('/admin/api/keys/'+id, {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled})});
+      loadData();
+    }
+    async function deleteKey(id) {
+      if (!confirm('确定删除?')) return;
+      await fetch('/admin/api/keys/'+id, {method:'DELETE'});
+      loadData();
+    }
     async function addPreset() {
-      const keywords = document.getElementById('newKeywords').value.split(',').map(k => k.trim()).filter(k => k);
-      const matchCount = parseInt(document.getElementById('newMatchCount').value) || 1;
+      const keywords = document.getElementById('newKeywords').value.split(',').map(k=>k.trim()).filter(k=>k);
+      const matchCount = parseInt(document.getElementById('newMatchCount').value)||1;
       const response = document.getElementById('newResponse').value;
-
-      if (!keywords.length || !response) {
-        alert('请填写关键词和回复内容');
-        return;
-      }
-
-      await fetch('/admin/api/presets', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ keywords, matchCount, response })
-      });
-
+      if (!keywords.length || !response) return alert('请填写完整');
+      await fetch('/admin/api/presets', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({keywords,matchCount,response})});
       document.getElementById('newKeywords').value = '';
       document.getElementById('newResponse').value = '';
       loadData();
     }
-
-    async function deletePreset(index) {
-      if (confirm('确定删除这条预设？')) {
-        await fetch('/admin/api/presets/' + index, { method: 'DELETE' });
-        loadData();
-      }
+    async function deletePreset(i) {
+      if (!confirm('确定删除?')) return;
+      await fetch('/admin/api/presets/'+i, {method:'DELETE'});
+      loadData();
     }
-
     loadData();
   </script>
 </body>
@@ -464,6 +580,7 @@ function createAdminHTML() {
 async function init() {
   await loadStats();
   await loadPresets();
+  await loadKeys();
   
   app.listen(PORT, "0.0.0.0", () => {
     console.log("代理服务器运行在端口 " + PORT);
