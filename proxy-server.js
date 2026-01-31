@@ -2,6 +2,7 @@ const express = require("express");
 const { createProxyMiddleware } = require("http-proxy-middleware");
 const cors = require("cors");
 const fs = require("fs");
+const fsPromises = require("fs").promises;
 const path = require("path");
 
 const app = express();
@@ -9,6 +10,10 @@ const PORT = 5000;
 
 // 目标 API 地址
 const TARGET_API = "https://open.bigmodel.cn/api/anthropic";
+
+// 管理后台认证配置
+const ADMIN_USER = process.env.ADMIN_USER || "admin";
+const ADMIN_PASS = process.env.ADMIN_PASS || "evclaude2024";
 
 // 统计数据存储文件
 const STATS_FILE = path.join(__dirname, "stats.json");
@@ -30,14 +35,29 @@ let stats = {
   lastUpdated: new Date().toISOString()
 };
 
-// 预设问答列表
 let presets = [];
 
+// Basic Auth 中间件 (安全认证)
+function basicAuth(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith("Basic ")) {
+    res.setHeader("WWW-Authenticate", 'Basic realm="Admin"');
+    return res.status(401).send("Authentication required");
+  }
+  const credentials = Buffer.from(authHeader.slice(6), "base64").toString();
+  const [user, pass] = credentials.split(":");
+  if (user === ADMIN_USER && pass === ADMIN_PASS) {
+    return next();
+  }
+  res.setHeader("WWW-Authenticate", 'Basic realm="Admin"');
+  return res.status(401).send("Invalid credentials");
+}
+
 // 加载统计数据
-function loadStats() {
+async function loadStats() {
   try {
     if (fs.existsSync(STATS_FILE)) {
-      const data = fs.readFileSync(STATS_FILE, "utf8");
+      const data = await fsPromises.readFile(STATS_FILE, "utf8");
       stats = JSON.parse(data);
 
       const today = new Date().toDateString();
@@ -53,20 +73,28 @@ function loadStats() {
 }
 
 // 保存统计数据
-function saveStats() {
+let saveStatsTimer = null;
+const SAVE_DEBOUNCE_MS = 5000;
+
+async function saveStats() {
   try {
     stats.lastUpdated = new Date().toISOString();
-    fs.writeFileSync(STATS_FILE, JSON.stringify(stats, null, 2));
+    await fsPromises.writeFile(STATS_FILE, JSON.stringify(stats, null, 2));
   } catch (error) {
     console.error("保存统计数据失败:", error);
   }
 }
 
+function debouncedSaveStats() {
+  if (saveStatsTimer) clearTimeout(saveStatsTimer);
+  saveStatsTimer = setTimeout(() => saveStats(), SAVE_DEBOUNCE_MS);
+}
+
 // 加载预设问答
-function loadPresets() {
+async function loadPresets() {
   try {
     if (fs.existsSync(PRESETS_FILE)) {
-      const data = fs.readFileSync(PRESETS_FILE, "utf8");
+      const data = await fsPromises.readFile(PRESETS_FILE, "utf8");
       presets = JSON.parse(data);
       console.log(`已加载 ${presets.length} 条预设问答`);
     } else {
@@ -102,9 +130,9 @@ function loadPresets() {
 }
 
 // 保存预设问答
-function savePresets() {
+async function savePresets() {
   try {
-    fs.writeFileSync(PRESETS_FILE, JSON.stringify(presets, null, 2));
+    await fsPromises.writeFile(PRESETS_FILE, JSON.stringify(presets, null, 2));
   } catch (error) {
     console.error("保存预设问答失败:", error);
   }
@@ -210,7 +238,7 @@ function updateStats(endpoint, success) {
   }
   stats.endpoints[endpoint].count++;
 
-  saveStats();
+  debouncedSaveStats();
 }
 
 // 启用 CORS
@@ -259,9 +287,7 @@ const proxy = createProxyMiddleware({
   proxyTimeout: 300000,
   onProxyReq: (proxyReq, req, res) => {
     console.log("[REQUEST] " + req.method + " " + req.url + " -> " + TARGET_API + req.url);
-    updateStats(req.path, true);
 
-    // 重新写入请求体（因为 express.json() 已经消费了原始流）
     if (req.body && Object.keys(req.body).length > 0) {
       const bodyData = JSON.stringify(req.body);
       proxyReq.setHeader("Content-Type", "application/json");
@@ -270,7 +296,9 @@ const proxy = createProxyMiddleware({
     }
   },
   onProxyRes: (proxyRes, req, res) => {
+    const success = proxyRes.statusCode >= 200 && proxyRes.statusCode < 400;
     console.log("[RESPONSE] " + req.method + " " + req.url + " -> " + proxyRes.statusCode);
+    updateStats(req.path, success);
   },
   onError: (err, req, res) => {
     console.error("[PROXY ERROR]", err.message);
@@ -284,17 +312,15 @@ const proxy = createProxyMiddleware({
   }
 });
 
-// API 统计接口
-app.get("/admin/api/stats", (req, res) => {
+app.get("/admin/api/stats", basicAuth, (req, res) => {
   res.json(stats);
 });
 
-// 预设管理 API
-app.get("/admin/api/presets", (req, res) => {
+app.get("/admin/api/presets", basicAuth, (req, res) => {
   res.json(presets);
 });
 
-app.post("/admin/api/presets", (req, res) => {
+app.post("/admin/api/presets", basicAuth, (req, res) => {
   const { keywords, matchCount, response } = req.body;
   if (!keywords || !response) {
     return res.status(400).json({ error: "缺少 keywords 或 response" });
@@ -304,7 +330,7 @@ app.post("/admin/api/presets", (req, res) => {
   res.json({ success: true, count: presets.length });
 });
 
-app.delete("/admin/api/presets/:index", (req, res) => {
+app.delete("/admin/api/presets/:index", basicAuth, (req, res) => {
   const index = parseInt(req.params.index);
   if (index >= 0 && index < presets.length) {
     presets.splice(index, 1);
@@ -315,13 +341,11 @@ app.delete("/admin/api/presets/:index", (req, res) => {
   }
 });
 
-// 管理后台主页
-app.get("/admin", (req, res) => {
+app.get("/admin", basicAuth, (req, res) => {
   res.send(createAdminHTML());
 });
 
-// 管理后台详情页
-app.get("/admin/stats", (req, res) => {
+app.get("/admin/stats", basicAuth, (req, res) => {
   res.send(createAdminHTML());
 });
 
@@ -437,12 +461,15 @@ function createAdminHTML() {
 </html>`;
 }
 
-// 初始化
-loadStats();
-loadPresets();
+async function init() {
+  await loadStats();
+  await loadPresets();
+  
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log("代理服务器运行在端口 " + PORT);
+    console.log("管理后台: http://localhost:" + PORT + "/admin");
+    console.log("所有请求将被转发到: " + TARGET_API);
+  });
+}
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log("代理服务器运行在端口 " + PORT);
-  console.log("管理后台: http://localhost:" + PORT + "/admin");
-  console.log("所有请求将被转发到: " + TARGET_API);
-});
+init();
